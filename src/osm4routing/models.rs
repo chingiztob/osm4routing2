@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use super::categorize::EdgeProperties;
 
-use super::reader::{NodeId, WayId};
+pub use super::reader::{NodeId, WayId};
 
 // Coord are coordinates in decimal degress WGS84
 type Coord = geo_types::Coord<f64>;
