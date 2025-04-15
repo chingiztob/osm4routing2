@@ -1,8 +1,13 @@
 use super::categorize::*;
 use super::models::*;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use osmpbfreader::objects::{NodeId, WayId};
+use osmpbf::{Element, ElementReader};
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WayId(pub i64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NodeId(pub i64);
 
 // Way as represented in OpenStreetMap
 struct Way {
@@ -122,7 +127,7 @@ impl Reader {
 
         // We build an adjacency map for every node that might have exactly two edges
         let mut neighbors: HashMap<NodeId, Vec<_>> = HashMap::new();
-        for edge in edges.iter() {
+        for edge in &edges {
             // Extremities of a way in `count_nodes_uses` are counted twice to avoid pruning deadends.
             // We want to look at nodes with at two extremities, hence 4 uses
             if !self.nodes.contains_key(&edge.source) {
@@ -175,19 +180,19 @@ impl Reader {
         }
     }
 
-    fn is_user_rejected(&self, way: &osmpbfreader::Way) -> bool {
+    fn is_user_rejected(&self, way: &osmpbf::Way) -> bool {
         let meet_required_tags = self.required_tags.is_empty()
-            || way.tags.iter().any(|(key, val)| {
+            || way.tags().any(|(key, val)| {
                 self.required_tags
-                    .get(key.as_str())
-                    .map(|values| values.contains(val.as_str()) || values.contains("*"))
+                    .get(key)
+                    .map(|values| values.contains(val) || values.contains("*"))
                     == Some(true)
             });
 
-        let has_forbidden_tags = way.tags.iter().any(|(key, val)| {
+        let has_forbidden_tags = way.tags().any(|(key, val)| {
             self.forbidden_tags
-                .get(key.as_str())
-                .map(|vals| vals.contains(val.as_str()) || vals.contains("*"))
+                .get(key)
+                .map(|vals| vals.contains(val) || vals.contains("*"))
                 == Some(true)
         });
 
@@ -195,54 +200,126 @@ impl Reader {
     }
 
     fn read_ways(&mut self, file: std::fs::File) {
-        let mut pbf = osmpbfreader::OsmPbfReader::new(file);
-        for obj in pbf.par_iter().flatten() {
-            if let osmpbfreader::OsmObj::Way(way) = obj {
-                let mut properties = EdgeProperties::default();
-                let mut tags = HashMap::new();
-                for (key, val) in way.tags.iter() {
-                    properties.update(key.to_string(), val.to_string());
-                    if self.tags_to_read.contains(key.as_str()) {
-                        tags.insert(key.to_string(), val.to_string());
+        let pbf = ElementReader::new(file);
+
+        let result = pbf.par_map_reduce(
+            // Mapper function
+            |obj| {
+                let mut ways_to_add = Vec::new();
+                let mut nodes_to_keep = HashSet::new();
+
+                if let Element::Way(way) = obj {
+                    let mut properties = EdgeProperties::default();
+                    let mut tags = HashMap::new();
+
+                    for (key, val) in way.tags() {
+                        properties.update_with_str(key, val);
+                        if self.tags_to_read.contains(key) {
+                            tags.insert(key.to_string(), val.to_string());
+                        }
+                    }
+
+                    properties.normalize();
+
+                    let is_rejected = &self.is_user_rejected(&way);
+
+                    if properties.accessible() && !is_rejected {
+                        for node in way.refs() {
+                            nodes_to_keep.insert(NodeId(node));
+                        }
+                        ways_to_add.push(Way {
+                            id: WayId(way.id()),
+                            nodes: way.refs().map(NodeId).collect(),
+                            properties,
+                            tags,
+                        });
                     }
                 }
-                properties.normalize();
-                if properties.accessible() && !self.is_user_rejected(&way) {
-                    for node in &way.nodes {
-                        self.nodes_to_keep.insert(*node);
-                    }
-                    self.ways.push(Way {
-                        id: way.id,
-                        nodes: way.nodes,
-                        properties,
-                        tags,
-                    });
-                }
-            }
-        }
+
+                (ways_to_add, nodes_to_keep)
+            },
+            // Identity for empty results
+            || (Vec::new(), HashSet::new()),
+            // Reducer function
+            |(mut acc_ways, mut acc_nodes), (ways, nodes)| {
+                acc_ways.extend(ways);
+                acc_nodes.extend(nodes);
+                (acc_ways, acc_nodes)
+            },
+        );
+
+        // Apply the collected changes
+        let (ways_to_add, nodes_to_keep) = result.unwrap();
+        self.ways = ways_to_add;
+        self.nodes_to_keep = nodes_to_keep;
     }
 
     fn read_nodes(&mut self, file: std::fs::File) {
-        let mut pbf = osmpbfreader::OsmPbfReader::new(file);
+        let pbf = ElementReader::new(file);
         self.nodes.reserve(self.nodes_to_keep.len());
-        for obj in pbf.par_iter().flatten() {
-            if let osmpbfreader::OsmObj::Node(node) = obj {
-                if self.nodes_to_keep.contains(&node.id) {
-                    self.nodes_to_keep.remove(&node.id);
-                    self.nodes.insert(
-                        node.id,
-                        Node {
-                            id: node.id,
-                            coord: geo_types::Coord {
-                                x: node.lon(),
-                                y: node.lat(),
-                            },
-                            uses: 0,
-                        },
-                    );
+
+        let result = pbf.par_map_reduce(
+            // Mapper function
+            |obj| {
+                let mut nodes_to_insert = HashMap::new();
+                let mut ids_to_remove = Vec::new();
+
+                match obj {
+                    Element::Node(node) => {
+                        let node_id = NodeId(node.id());
+                        if self.nodes_to_keep.contains(&node_id) {
+                            ids_to_remove.push(node_id);
+                            nodes_to_insert.insert(
+                                node_id,
+                                Node {
+                                    id: node_id,
+                                    coord: geo_types::Coord {
+                                        x: node.lon(),
+                                        y: node.lat(),
+                                    },
+                                    uses: 0,
+                                },
+                            );
+                        }
+                    }
+                    Element::DenseNode(node) => {
+                        let node_id = NodeId(node.id());
+                        if self.nodes_to_keep.contains(&node_id) {
+                            ids_to_remove.push(node_id);
+                            nodes_to_insert.insert(
+                                node_id,
+                                Node {
+                                    id: node_id,
+                                    coord: geo_types::Coord {
+                                        x: node.lon(),
+                                        y: node.lat(),
+                                    },
+                                    uses: 0,
+                                },
+                            );
+                        }
+                    }
+                    _ => (),
                 }
-            }
+
+                (nodes_to_insert, ids_to_remove)
+            },
+            // Identity for empty results
+            || (HashMap::new(), Vec::new()),
+            // Reducer function
+            |(mut acc_nodes, mut acc_ids), (nodes, ids)| {
+                acc_nodes.extend(nodes);
+                acc_ids.extend(ids);
+                (acc_nodes, acc_ids)
+            },
+        );
+
+        // Apply the collected changes
+        let (nodes_to_insert, ids_to_remove) = result.unwrap();
+        for id in ids_to_remove {
+            self.nodes_to_keep.remove(&id);
         }
+        self.nodes.extend(nodes_to_insert);
     }
 
     fn nodes(&self) -> Vec<Node> {
@@ -299,8 +376,8 @@ fn test_count_nodes() {
     nodes.insert(NodeId(2), Node::default());
     nodes.insert(NodeId(3), Node::default());
     let mut r = Reader {
-        ways,
         nodes,
+        ways,
         ..Default::default()
     };
     r.count_nodes_uses();
@@ -349,7 +426,7 @@ fn test_wrong_file() {
 fn forbidden_values() {
     let (_, ways) = Reader::new()
         .reject("highway", "secondary")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
     assert_eq!(0, ways.len());
 }
@@ -358,7 +435,7 @@ fn forbidden_values() {
 fn forbidden_wildcard() {
     let (_, ways) = Reader::new()
         .reject("highway", "*")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
     assert_eq!(0, ways.len());
 }
@@ -366,9 +443,7 @@ fn forbidden_wildcard() {
 #[test]
 fn way_of_node() {
     let mut r = Reader::new();
-    let (_nodes, edges) = r
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
-        .unwrap();
+    let (_nodes, edges) = r.read("src/osm4routing/test_data/minimal.osm.pbf").unwrap();
 
     assert_eq!(2, edges[0].nodes.len());
 }
@@ -377,7 +452,7 @@ fn way_of_node() {
 fn read_tags() {
     let (_nodes, edges) = Reader::new()
         .read_tag("highway")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
 
     assert_eq!("secondary", edges[0].tags.get("highway").unwrap());
@@ -387,7 +462,7 @@ fn read_tags() {
 fn require_value_ok() {
     let (_, ways) = Reader::new()
         .require("highway", "secondary")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
     assert_eq!(1, ways.len());
 }
@@ -396,7 +471,7 @@ fn require_value_ok() {
 fn require_value_missing() {
     let (_, ways) = Reader::new()
         .require("highway", "primary")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
     assert_eq!(0, ways.len());
 }
@@ -405,7 +480,7 @@ fn require_value_missing() {
 fn require_wildcart() {
     let (_, ways) = Reader::new()
         .require("highway", "*")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
     assert_eq!(1, ways.len());
 }
@@ -415,7 +490,7 @@ fn require_multiple_tags() {
     let (_, ways) = Reader::new()
         .require("highway", "primary")
         .require("highway", "secondary")
-        .read(&"src/osm4routing/test_data/minimal.osm.pbf")
+        .read("src/osm4routing/test_data/minimal.osm.pbf")
         .unwrap();
     assert_eq!(1, ways.len());
 }
@@ -423,13 +498,13 @@ fn require_multiple_tags() {
 #[test]
 fn merging_edges() {
     let (_nodes, edges) = Reader::new()
-        .read(&"src/osm4routing/test_data/ways_to_merge.osm.pbf")
+        .read("src/osm4routing/test_data/ways_to_merge.osm.pbf")
         .unwrap();
     assert_eq!(2, edges.len());
 
     let (_nodes, edges) = Reader::new()
         .merge_ways()
-        .read(&"src/osm4routing/test_data/ways_to_merge.osm.pbf")
+        .read("src/osm4routing/test_data/ways_to_merge.osm.pbf")
         .unwrap();
     assert_eq!(1, edges.len());
 }

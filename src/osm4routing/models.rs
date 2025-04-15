@@ -2,7 +2,8 @@ use ahash::HashMap;
 use std::hash::{Hash, Hasher};
 
 use super::categorize::EdgeProperties;
-pub use osmpbfreader::objects::{NodeId, WayId};
+
+use super::reader::{NodeId, WayId};
 
 // Coord are coordinates in decimal degress WGS84
 type Coord = geo_types::Coord<f64>;
@@ -40,7 +41,7 @@ impl Default for Node {
     fn default() -> Node {
         Node {
             id: NodeId(0),
-            coord: Default::default(),
+            coord: Coord::default(),
             uses: Default::default(),
         }
     }
@@ -76,7 +77,7 @@ impl Eq for Edge {}
 impl Default for Edge {
     fn default() -> Self {
         Self {
-            id: "".to_string(),
+            id: String::new(),
             osm_id: WayId(0),
             source: NodeId(1),
             target: NodeId(1),

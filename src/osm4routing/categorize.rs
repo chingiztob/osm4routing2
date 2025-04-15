@@ -169,7 +169,7 @@ impl EdgeProperties {
             },
             "busway" => match val {
                 "opposite_lane" | "opposite_track" => {
-                    self.bike_backward = BikeAccessibility::Busway
+                    self.bike_backward = BikeAccessibility::Busway;
                 }
                 _ => self.bike_forward = BikeAccessibility::Busway,
             },
@@ -205,7 +205,7 @@ fn test_accessible() {
     assert!(!p.accessible());
 
     p.foot = FootAccessibility::Allowed;
-    assert!(p.accessible())
+    assert!(p.accessible());
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn test_normalize() {
     p.car_forward = CarAccessibility::Secondary;
     p.car_backward = CarAccessibility::Unknown;
     p.normalize();
-    assert_eq!(CarAccessibility::Secondary, p.car_backward)
+    assert_eq!(CarAccessibility::Secondary, p.car_backward);
 }
 
 #[test]
