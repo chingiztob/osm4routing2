@@ -1,4 +1,4 @@
-use super::models::*;
+use super::models::{Edge, Node};
 
 pub fn csv(nodes: Vec<Node>, edges: Vec<Edge>, nodes_file: &str, edges_file: &str) {
     let edges_path = std::path::Path::new(edges_file);

@@ -25,7 +25,7 @@ fn main() {
 
     match reader.read(&cli.source_pbf) {
         Ok((nodes, edges)) => {
-            osm4routing::writers::csv(nodes, edges, &cli.nodes_file, &cli.edges_file)
+            osm4routing::writers::csv(nodes, edges, &cli.nodes_file, &cli.edges_file);
         }
         Err(error) => println!("Error: {}", error),
     }

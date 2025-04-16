@@ -1,6 +1,6 @@
-use super::categorize::*;
-use super::models::*;
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use super::categorize::EdgeProperties;
+use super::models::{Edge, Node};
+use hashbrown::{HashMap, HashSet};
 use osmpbf::{Element, IndexedReader};
 use std::path::Path;
 
@@ -155,15 +155,16 @@ impl Reader {
                 && !already_merged.contains(&edges[0].id)
                 && !already_merged.contains(&edges[1].id)
             {
-                let edge1 = edges[0];
-                let edge2 = edges[1];
-                result.push(Edge::merge(edge1, edge2, node));
-                already_merged.insert(edge1.id.clone());
-                already_merged.insert(edge2.id.clone());
+                let edge_1 = edges[0];
+                let edge_2 = edges[1];
+                result.push(Edge::merge(edge_1, edge_2, node));
+                already_merged.insert(edge_1.id.clone());
+                already_merged.insert(edge_2.id.clone());
                 self.nodes.remove(&node);
             }
         }
 
+        drop(neighbors);
         for edge in edges {
             if !already_merged.contains(&edge.id) {
                 result.push(edge);

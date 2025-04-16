@@ -1,4 +1,4 @@
-use ahash::HashMap;
+use hashbrown::HashMap;
 use std::hash::{Hash, Hasher};
 
 use super::categorize::EdgeProperties;
