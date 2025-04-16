@@ -1,7 +1,7 @@
 use super::categorize::*;
 use super::models::*;
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
-use osmpbf::{Element, ElementReader};
+use osmpbf::{Element, IndexedReader};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,7 +32,6 @@ impl Default for Way {
 pub struct Reader {
     nodes: HashMap<NodeId, Node>,
     ways: Vec<Way>,
-    nodes_to_keep: HashSet<NodeId>,
     forbidden_tags: HashMap<String, HashSet<String>>,
     required_tags: HashMap<String, HashSet<String>>,
     tags_to_read: HashSet<String>,
@@ -113,7 +112,7 @@ impl Reader {
 
                 source = node_id;
                 geometry = vec![node.coord];
-                nodes = vec![node.id]
+                nodes = vec![node.id];
             }
         }
         result
@@ -199,77 +198,45 @@ impl Reader {
         !meet_required_tags || has_forbidden_tags
     }
 
-    fn read_ways(&mut self, file: std::fs::File) {
-        let pbf = ElementReader::new(file);
+    fn read_all(&mut self, file: std::fs::File) -> Result<(), String> {
+        let buf_reader = std::io::BufReader::new(file);
+        let mut reader = IndexedReader::new(buf_reader).map_err(|e| e.to_string())?;
 
-        let result = pbf.par_map_reduce(
-            // Mapper function
-            |obj| {
-                let mut ways_to_add = Vec::new();
-                let mut nodes_to_keep = HashSet::new();
+        reader
+            .read_ways_and_deps(
+                |_way| {
+                    // Filter ways. Return true if tags contain "building": "yes".
+                    // way.tags().any(|(k, _v)| k == "highway");
+                    true
+                },
+                |element| {
+                    // Increment counter
+                    match element {
+                        Element::Way(way) => {
+                            if !&self.is_user_rejected(way) {
+                                let mut properties = EdgeProperties::default();
+                                let mut tags = HashMap::new();
 
-                if let Element::Way(way) = obj {
-                    let mut properties = EdgeProperties::default();
-                    let mut tags = HashMap::new();
+                                for (key, val) in way.tags() {
+                                    properties.update_with_str(key, val);
+                                    if self.tags_to_read.contains(key) {
+                                        tags.insert(key.to_string(), val.to_string());
+                                    }
+                                }
 
-                    for (key, val) in way.tags() {
-                        properties.update_with_str(key, val);
-                        if self.tags_to_read.contains(key) {
-                            tags.insert(key.to_string(), val.to_string());
+                                if properties.accessible() {
+                                    self.ways.push(Way {
+                                        id: WayId(way.id()),
+                                        nodes: way.refs().map(NodeId).collect(),
+                                        properties,
+                                        tags,
+                                    });
+                                }
+                            }
                         }
-                    }
-
-                    properties.normalize();
-
-                    let is_rejected = &self.is_user_rejected(&way);
-
-                    if properties.accessible() && !is_rejected {
-                        for node in way.refs() {
-                            nodes_to_keep.insert(NodeId(node));
-                        }
-                        ways_to_add.push(Way {
-                            id: WayId(way.id()),
-                            nodes: way.refs().map(NodeId).collect(),
-                            properties,
-                            tags,
-                        });
-                    }
-                }
-
-                (ways_to_add, nodes_to_keep)
-            },
-            // Identity for empty results
-            || (Vec::new(), HashSet::new()),
-            // Reducer function
-            |(mut acc_ways, mut acc_nodes), (ways, nodes)| {
-                acc_ways.extend(ways);
-                acc_nodes.extend(nodes);
-                (acc_ways, acc_nodes)
-            },
-        );
-
-        // Apply the collected changes
-        let (ways_to_add, nodes_to_keep) = result.unwrap();
-        self.ways = ways_to_add;
-        self.nodes_to_keep = nodes_to_keep;
-    }
-
-    fn read_nodes(&mut self, file: std::fs::File) {
-        let pbf = ElementReader::new(file);
-        self.nodes.reserve(self.nodes_to_keep.len());
-
-        let result = pbf.par_map_reduce(
-            // Mapper function
-            |obj| {
-                let mut nodes_to_insert = HashMap::new();
-                let mut ids_to_remove = Vec::new();
-
-                match obj {
-                    Element::Node(node) => {
-                        let node_id = NodeId(node.id());
-                        if self.nodes_to_keep.contains(&node_id) {
-                            ids_to_remove.push(node_id);
-                            nodes_to_insert.insert(
+                        Element::Node(node) => {
+                            let node_id = NodeId(node.id());
+                            self.nodes.insert(
                                 node_id,
                                 Node {
                                     id: node_id,
@@ -281,12 +248,9 @@ impl Reader {
                                 },
                             );
                         }
-                    }
-                    Element::DenseNode(node) => {
-                        let node_id = NodeId(node.id());
-                        if self.nodes_to_keep.contains(&node_id) {
-                            ids_to_remove.push(node_id);
-                            nodes_to_insert.insert(
+                        Element::DenseNode(node) => {
+                            let node_id = NodeId(node.id());
+                            self.nodes.insert(
                                 node_id,
                                 Node {
                                     id: node_id,
@@ -298,28 +262,13 @@ impl Reader {
                                 },
                             );
                         }
+                        Element::Relation(_) => (), // should not occur
                     }
-                    _ => (),
-                }
+                },
+            )
+            .map_err(|e| e.to_string())?;
 
-                (nodes_to_insert, ids_to_remove)
-            },
-            // Identity for empty results
-            || (HashMap::new(), Vec::new()),
-            // Reducer function
-            |(mut acc_nodes, mut acc_ids), (nodes, ids)| {
-                acc_nodes.extend(nodes);
-                acc_ids.extend(ids);
-                (acc_nodes, acc_ids)
-            },
-        );
-
-        // Apply the collected changes
-        let (nodes_to_insert, ids_to_remove) = result.unwrap();
-        for id in ids_to_remove {
-            self.nodes_to_keep.remove(&id);
-        }
-        self.nodes.extend(nodes_to_insert);
+        Ok(())
     }
 
     fn nodes(&self) -> Vec<Node> {
@@ -339,9 +288,7 @@ impl Reader {
 
     pub fn read<P: AsRef<Path>>(&mut self, filename: P) -> Result<(Vec<Node>, Vec<Edge>), String> {
         let file = std::fs::File::open(filename.as_ref()).map_err(|e| e.to_string())?;
-        self.read_ways(file);
-        let file_nodes = std::fs::File::open(filename.as_ref()).map_err(|e| e.to_string())?;
-        self.read_nodes(file_nodes);
+        self.read_all(file)?;
         self.count_nodes_uses();
 
         let edges = if self.should_merge_ways {

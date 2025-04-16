@@ -98,12 +98,6 @@ impl EdgeProperties {
             || self.train != TrainAccessibility::Forbidden
     }
 
-    pub fn update(&mut self, key_string: String, val_string: String) {
-        let key = key_string.as_str();
-        let val = val_string.as_str();
-        self.update_with_str(key, val);
-    }
-
     pub fn update_with_str(&mut self, key: &str, val: &str) {
         match key {
             "highway" => match val {
